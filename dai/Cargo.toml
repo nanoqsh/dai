@@ -13,6 +13,9 @@ name = "dai"
 path = "src/main.rs"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+ureq = { workspace = true, features = ["rustls"] }
 
 [lints]
 workspace = true
