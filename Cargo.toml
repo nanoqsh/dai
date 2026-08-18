@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["dai"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+authors = ["nanoqsh"]
+repository = "https://github.com/nanoqsh/dai"
+rust-version = "1.96"
+
+[workspace.dependencies]
+# workspace
+dai = { version = "=0.0.1", path = "dai" }
+# third-party
+#
+
+[workspace.lints.rust]
+elided-lifetimes-in-paths = "warn"
+
+[workspace.lints.clippy]
+large-futures = "warn"
+manual-assert = "warn"
+match-wildcard-for-single-variants = "warn"
+missing-assert-message = "warn"
+needless-continue = "warn"
+semicolon-if-nothing-returned = "warn"
+trivially-copy-pass-by-ref = "warn"
+use-self = "warn"
+unwrap-used = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+opt-level = 1
+panic = "abort"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
