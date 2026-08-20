@@ -1,5 +1,9 @@
+mod http;
+mod provider;
+
 use {
-    futures_lite::stream,
+    crate::{http::Http, provider::*},
+    rand::RngExt,
     serde::{Deserialize, Serialize},
     serde_json::{Value, value::RawValue},
     std::{
@@ -7,17 +11,26 @@ use {
         error,
         io::{BufReader, prelude::BufRead},
     },
-    ureq::{config::Config, http::StatusCode},
+    ureq::http::{HeaderValue, StatusCode},
 };
 
 type Run<T> = Result<T, Box<dyn error::Error>>;
 
 pub fn run() -> Run<()> {
     let key = env!("OPENROUTER_API_KEY");
-    let header = format!("Bearer {key}");
+    let auth = HeaderValue::try_from(format!("Bearer {key}"))?;
 
-    let conf = Config::builder().http_status_as_error(false).build();
-    let http = ureq::Agent::new_with_config(conf);
+    let http = Http::new();
+
+    let conf = Config {
+        key,
+        model: "openai/gpt-oss-120b".into(),
+        tools: &[Tool {
+            name: "weather".into(),
+            description: "Read current weather for the default (user's) location".into(),
+            parameters: Parameters {},
+        }],
+    };
 
     let req = HttpRequest {
         model: "openai/gpt-oss-120b",
@@ -47,30 +60,34 @@ pub fn run() -> Run<()> {
             //     content: "спосибо",
             // },
         ],
-        tools: vec![Tool {
-            ty: ToolType::Function,
-            name: "weather",
-            description: "Read current weather for the default (user's) location",
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }),
-        }],
+        tools: &tools_json(conf.tools)?,
         previous_response_id: None,
     };
 
     let body = serde_json::to_string(&req)?;
-    let mut res = http
-        .post("https://openrouter.ai/api/v1/responses")
-        .header("Authorization", &header)
-        .header("Content-Type", "application/json")
-        .send(body)?;
+    let mut res = http.post(
+        "https://openrouter.ai/api/v1/responses",
+        &mut [
+            ("Authorization", auth.clone()),
+            ("Content-Type", HeaderValue::from_static("application/json")),
+        ]
+        .into_iter(),
+        body,
+    )?;
 
     if res.status() != StatusCode::OK {
         eprintln!("non ok status: {}", res.status());
-        eprintln!("body: {}", res.body_mut().read_to_string()?);
+        let body = res.body_mut().read_to_string()?;
+
+        if let Some(content_type) = res.headers().get("Content-Type")
+            && content_type == "application/json"
+        {
+            let body: Value = serde_json::from_str(&body)?;
+            eprintln!("body: {body:#}");
+        } else {
+            eprintln!("body: {body}");
+        }
+
         return Ok(());
     }
 
@@ -89,33 +106,23 @@ pub fn run() -> Run<()> {
             let Header { ty } = serde_json::from_str(data)
                 .inspect_err(|_| eprintln!("failed to parse json: {data}"))?;
 
-            println!("new event with type: {ty}");
+            println!("=={ty}");
 
             match ty {
                 "response.created" => {
                     let event: ResponseEvent<'_> = serde_json::from_str(data)?;
-                    println!("response={:?}", &event.response);
+                    println!("response={:?}", event.response);
+                    println!("response id={:?}", event.response.id);
                 }
                 "response.in_progress" => {
                     let event: ResponseEvent<'_> = serde_json::from_str(data)?;
-                    println!("response={:?}", &event.response);
+                    println!("response={:?}", event.response);
                 }
                 "response.completed" => {
                     let event: ResponseEvent<'_> = serde_json::from_str(data)?;
-                    println!("response={:?}", &event.response);
+                    println!("response={:?}", event.response);
                 }
-                "response.output_item.added" => {
-                    #[derive(Deserialize)]
-                    struct Added<'src> {
-                        output_index: u64,
-                        #[serde(borrow)]
-                        item: Output<'src>,
-                    }
-
-                    let event: Added<'_> = serde_json::from_str(data)?;
-                    println!("output_index={}", event.output_index);
-                    println!("item={:?}", &event.item);
-                }
+                "response.output_item.added" => {}
                 "response.output_item.done" => {
                     #[derive(Deserialize)]
                     struct Done<'src> {
@@ -149,20 +156,7 @@ pub fn run() -> Run<()> {
                         println!("EVENT: {out:?}");
                     }
                 }
-                "response.content_part.added" => {
-                    #[derive(Deserialize)]
-                    struct Added<'src> {
-                        output_index: u64,
-                        item_id: &'src str,
-                        #[serde(borrow)]
-                        part: &'src RawValue,
-                    }
-
-                    let event: Added<'_> = serde_json::from_str(data)?;
-                    println!("output_index={}", event.output_index);
-                    println!("item_id={}", event.item_id);
-                    println!("part={}", event.part.get());
-                }
+                "response.content_part.added" => {}
                 "response.content_part.done" => {
                     #[derive(Deserialize)]
                     struct Done<'src> {
@@ -192,14 +186,7 @@ pub fn run() -> Run<()> {
                     println!("EVENT: {out:?}");
                 }
                 "response.reasoning_text.done" => {
-                    #[derive(Deserialize)]
-                    struct Done<'src> {
-                        content_index: u64,
-                        item_id: &'src str,
-                        text: Cow<'src, str>,
-                    }
-
-                    let event: Done<'_> = serde_json::from_str(data)?;
+                    let event: DoneEvent<'_> = serde_json::from_str(data)?;
                     println!("content_index={}", event.content_index);
                     println!("item_id={}", event.item_id);
                     println!("text={}", event.text);
@@ -219,38 +206,33 @@ pub fn run() -> Run<()> {
                     println!("EVENT: {out:?}");
                 }
                 "response.output_text.done" => {
-                    #[derive(Deserialize)]
-                    struct Done<'src> {
-                        item_id: &'src str,
-                        text: Cow<'src, str>,
-                    }
-
-                    let event: Done<'_> = serde_json::from_str(data)?;
+                    let event: DoneEvent<'_> = serde_json::from_str(data)?;
+                    println!("content_index={}", event.content_index);
                     println!("item_id={}", event.item_id);
                     println!("text={}", event.text);
                 }
                 "response.function_call_arguments.delta" => {
                     #[derive(Deserialize)]
-                    struct Event<'src> {
+                    struct Delta<'src> {
                         item_id: &'src str,
                         output_index: u64,
                         delta: Cow<'src, str>,
                     }
 
-                    let event: Event<'_> = serde_json::from_str(data)?;
+                    let event: Delta<'_> = serde_json::from_str(data)?;
                     println!("item_id={}", event.item_id);
                     println!("output_index={}", event.output_index);
                     println!("delta={}", event.delta);
                 }
                 "response.function_call_arguments.done" => {
                     #[derive(Deserialize)]
-                    struct Event<'src> {
+                    struct Done<'src> {
                         item_id: &'src str,
                         output_index: u64,
                         arguments: Cow<'src, str>,
                     }
 
-                    let event: Event<'_> = serde_json::from_str(data)?;
+                    let event: Done<'_> = serde_json::from_str(data)?;
                     println!("item_id={}", event.item_id);
                     println!("output_index={}", event.output_index);
                     println!("arguments={}", event.arguments);
@@ -272,24 +254,9 @@ struct HttpRequest<'src> {
     stream: bool,
     instructions: &'src str,
     input: Vec<Input<'src>>,
-    tools: Vec<Tool<'src>>,
+    tools: &'src RawValue,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'src str>,
-}
-
-#[derive(Serialize)]
-struct Tool<'src> {
-    #[serde(rename = "type")]
-    ty: ToolType,
-    name: &'src str,
-    description: &'src str,
-    parameters: Value,
-}
-
-#[derive(Serialize)]
-enum ToolType {
-    #[serde(rename = "function")]
-    Function,
 }
 
 #[derive(Serialize)]
@@ -400,36 +367,87 @@ struct DeltaEvent<'src> {
     delta: Cow<'src, str>,
 }
 
-pub trait Provider {
-    fn req(&mut self, req: Request) -> stream::Boxed<Event>;
-}
-
-pub enum Request {
-    Message(String),
-    CallOutput,
-}
-
-#[derive(Debug)]
-pub enum Event {
-    Error(Error),
-    Reasoning(Delta),
-    Message(Delta),
-    Call(Call),
-}
-
-#[derive(Debug)]
-pub enum Error {}
-
-#[derive(Debug)]
-pub struct Delta {
+#[derive(Deserialize)]
+struct DoneEvent<'src> {
     content_index: u64,
-    item_id: Box<str>,
-    delta: String,
+    item_id: &'src str,
+    text: Cow<'src, str>,
 }
 
-#[derive(Debug)]
-pub struct Call {
-    call_id: Box<str>,
+pub struct Tool {
     name: Box<str>,
-    arguments: String,
+    description: Box<str>,
+    #[expect(dead_code)]
+    parameters: Parameters,
+}
+
+pub struct Parameters {}
+
+pub struct Config<'scope> {
+    key: &'scope str,
+    model: Box<str>,
+    tools: &'scope [Tool],
+}
+
+struct OpenApi {
+    auth: HeaderValue,
+    http: Http,
+    model: Box<str>,
+    session_id: Box<str>,
+    tools: Box<RawValue>,
+}
+
+impl OpenApi {
+    fn new(conf: Config<'_>) -> Run<Self> {
+        let key = conf.key;
+        let auth = HeaderValue::try_from(format!("Bearer {key}"))
+            .map_err(|_| format!("invalid auth key: {key}"))?;
+
+        let http = Http::new();
+
+        let mut rng = rand::rng();
+        let session_id: String = (0..7)
+            .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
+            .collect();
+
+        let tools =
+            tools_json(conf.tools).map_err(|e| format!("failed to serialize tools: {e}"))?;
+
+        Ok(Self {
+            auth,
+            http,
+            model: conf.model,
+            session_id: session_id.into_boxed_str(),
+            tools,
+        })
+    }
+}
+
+fn tools_json(tools: &[Tool]) -> Run<Box<RawValue>> {
+    #[derive(Serialize)]
+    struct WriteTool<'src> {
+        #[serde(rename = "type")]
+        ty: &'static str,
+        name: &'src str,
+        description: &'src str,
+        parameters: Value,
+    }
+
+    let write: Vec<_> = tools
+        .iter()
+        .map(|tool| WriteTool {
+            ty: "function",
+            name: &tool.name,
+            description: &tool.description,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        })
+        .collect();
+
+    let s = serde_json::to_string(&write)?;
+    Ok(RawValue::from_string(s)?)
 }
