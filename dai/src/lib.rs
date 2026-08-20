@@ -1,12 +1,13 @@
 use {
+    futures_lite::stream,
     serde::{Deserialize, Serialize},
-    serde_json::value::RawValue,
+    serde_json::{Value, value::RawValue},
     std::{
         borrow::Cow,
         error,
         io::{BufReader, prelude::BufRead},
     },
-    ureq::{Agent, config::Config, http::StatusCode},
+    ureq::{config::Config, http::StatusCode},
 };
 
 type Run<T> = Result<T, Box<dyn error::Error>>;
@@ -16,49 +17,48 @@ pub fn run() -> Run<()> {
     let header = format!("Bearer {key}");
 
     let conf = Config::builder().http_status_as_error(false).build();
-    let http = Agent::new_with_config(conf);
+    let http = ureq::Agent::new_with_config(conf);
 
-    let req = Request {
+    let req = HttpRequest {
         model: "openai/gpt-oss-120b",
         session_id: "1234",
         stream: true,
-        instructions: "You are an autonomous agent. Use tools when necessary",
+        instructions: "You are an autonomous agent. You have access to tools. Use tools when necessary to accomplish the user's task. When the task is complete, finish the run",
         input: vec![
             Input::Message {
                 role: Role::User,
                 content: "Привет! Какая сегодня погода?",
             },
-            Input::FunctionCall(FunctionCall {
-                call_id: "chatcmpl-tool-413befe9319d465ab967449233e2a9b3",
-                name: "weather",
-                arguments: "{}".to_owned(),
-            }),
-            Input::FunctionCallOutput(FunctionCallOutput {
-                call_id: "chatcmpl-tool-413befe9319d465ab967449233e2a9b3",
-                output: "23°C, clear",
-            }),
-            Input::Message {
-                role: Role::Assistant,
-                content: "Привет! Сегодня **23 °C**, ясно. 🌞",
-            },
-            Input::Message {
-                role: Role::User,
-                content: "спосибо",
-            },
+            // Input::FunctionCall(FunctionCall {
+            //     call_id: "call-db93a5c4-ab9a-4139-bbfb-b676c9366186",
+            //     name: "weather",
+            //     arguments: "{}".to_owned(),
+            // }),
+            // Input::FunctionCallOutput(FunctionCallOutput {
+            //     call_id: "call-db93a5c4-ab9a-4139-bbfb-b676c9366186",
+            //     output: "23°C, clear",
+            // }),
+            // Input::Message {
+            //     role: Role::Assistant,
+            //     content: "Привет! Сегодня **23 °C**, ясно. 🌞",
+            // },
+            // Input::Message {
+            //     role: Role::User,
+            //     content: "спосибо",
+            // },
         ],
         tools: vec![Tool {
             ty: ToolType::Function,
             name: "weather",
-            description: "Read current weather.",
+            description: "Read current weather for the default (user's) location",
             parameters: serde_json::json!({
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": false
-                }
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
             }),
         }],
+        previous_response_id: None,
     };
 
     let body = serde_json::to_string(&req)?;
@@ -86,12 +86,6 @@ pub fn run() -> Run<()> {
                 break;
             }
 
-            #[derive(Deserialize)]
-            struct Header<'src> {
-                #[serde(rename = "type")]
-                ty: &'src str,
-            }
-
             let Header { ty } = serde_json::from_str(data)
                 .inspect_err(|_| eprintln!("failed to parse json: {data}"))?;
 
@@ -99,48 +93,61 @@ pub fn run() -> Run<()> {
 
             match ty {
                 "response.created" => {
-                    #[derive(Deserialize)]
-                    struct Created<'src> {
-                        #[serde(borrow)]
-                        response: &'src RawValue,
-                    }
-
-                    let event: Created<'_> = serde_json::from_str(data)?;
-                    println!("response={}", event.response.get());
+                    let event: ResponseEvent<'_> = serde_json::from_str(data)?;
+                    println!("response={:?}", &event.response);
                 }
                 "response.in_progress" => {
-                    #[derive(Deserialize)]
-                    struct Progress<'src> {
-                        #[serde(borrow)]
-                        response: &'src RawValue,
-                    }
-
-                    let event: Progress<'_> = serde_json::from_str(data)?;
-                    println!("response={}", event.response.get());
+                    let event: ResponseEvent<'_> = serde_json::from_str(data)?;
+                    println!("response={:?}", &event.response);
+                }
+                "response.completed" => {
+                    let event: ResponseEvent<'_> = serde_json::from_str(data)?;
+                    println!("response={:?}", &event.response);
                 }
                 "response.output_item.added" => {
                     #[derive(Deserialize)]
                     struct Added<'src> {
                         output_index: u64,
                         #[serde(borrow)]
-                        item: &'src RawValue,
+                        item: Output<'src>,
                     }
 
                     let event: Added<'_> = serde_json::from_str(data)?;
                     println!("output_index={}", event.output_index);
-                    println!("item={}", event.item.get());
+                    println!("item={:?}", &event.item);
                 }
                 "response.output_item.done" => {
                     #[derive(Deserialize)]
                     struct Done<'src> {
                         output_index: u64,
                         #[serde(borrow)]
-                        item: &'src RawValue,
+                        item: Output<'src>,
                     }
 
                     let event: Done<'_> = serde_json::from_str(data)?;
                     println!("output_index={}", event.output_index);
-                    println!("item={}", event.item.get());
+                    println!("item={:?}", event.item);
+
+                    if let Output::FunctionCall {
+                        id: _,
+                        status,
+                        call_id,
+                        name,
+                        arguments,
+                    } = event.item
+                    {
+                        if status != "completed" {
+                            eprintln!("status should be completed, but it's {status}");
+                        }
+
+                        let out = Event::Call(Call {
+                            call_id: call_id.into(),
+                            name: name.into(),
+                            arguments: arguments.into_owned(),
+                        });
+
+                        println!("EVENT: {out:?}");
+                    }
                 }
                 "response.content_part.added" => {
                     #[derive(Deserialize)]
@@ -171,17 +178,18 @@ pub fn run() -> Run<()> {
                     println!("text={:?}", event.text);
                 }
                 "response.reasoning_text.delta" => {
-                    #[derive(Deserialize)]
-                    struct Delta<'src> {
-                        content_index: u64,
-                        item_id: &'src str,
-                        delta: Cow<'src, str>,
-                    }
-
-                    let event: Delta<'_> = serde_json::from_str(data)?;
+                    let event: DeltaEvent<'_> = serde_json::from_str(data)?;
                     println!("content_index={}", event.content_index);
                     println!("item_id={}", event.item_id);
                     println!("delta={}", event.delta);
+
+                    let out = Event::Reasoning(Delta {
+                        content_index: event.content_index,
+                        item_id: event.item_id.into(),
+                        delta: event.delta.into_owned(),
+                    });
+
+                    println!("EVENT: {out:?}");
                 }
                 "response.reasoning_text.done" => {
                     #[derive(Deserialize)]
@@ -197,17 +205,18 @@ pub fn run() -> Run<()> {
                     println!("text={}", event.text);
                 }
                 "response.output_text.delta" => {
-                    #[derive(Deserialize)]
-                    struct Delta<'src> {
-                        content_index: u64,
-                        item_id: &'src str,
-                        delta: Cow<'src, str>,
-                    }
-
-                    let event: Delta<'_> = serde_json::from_str(data)?;
+                    let event: DeltaEvent<'_> = serde_json::from_str(data)?;
                     println!("content_index={}", event.content_index);
                     println!("item_id={}", event.item_id);
                     println!("delta={}", event.delta);
+
+                    let out = Event::Message(Delta {
+                        content_index: event.content_index,
+                        item_id: event.item_id.into(),
+                        delta: event.delta.into_owned(),
+                    });
+
+                    println!("EVENT: {out:?}");
                 }
                 "response.output_text.done" => {
                     #[derive(Deserialize)]
@@ -220,15 +229,31 @@ pub fn run() -> Run<()> {
                     println!("item_id={}", event.item_id);
                     println!("text={}", event.text);
                 }
-                "response.completed" => {
+                "response.function_call_arguments.delta" => {
                     #[derive(Deserialize)]
-                    struct Completed<'src> {
-                        #[serde(borrow)]
-                        response: &'src RawValue,
+                    struct Event<'src> {
+                        item_id: &'src str,
+                        output_index: u64,
+                        delta: Cow<'src, str>,
                     }
 
-                    let event: Completed<'_> = serde_json::from_str(data)?;
-                    println!("response={}", event.response.get());
+                    let event: Event<'_> = serde_json::from_str(data)?;
+                    println!("item_id={}", event.item_id);
+                    println!("output_index={}", event.output_index);
+                    println!("delta={}", event.delta);
+                }
+                "response.function_call_arguments.done" => {
+                    #[derive(Deserialize)]
+                    struct Event<'src> {
+                        item_id: &'src str,
+                        output_index: u64,
+                        arguments: Cow<'src, str>,
+                    }
+
+                    let event: Event<'_> = serde_json::from_str(data)?;
+                    println!("item_id={}", event.item_id);
+                    println!("output_index={}", event.output_index);
+                    println!("arguments={}", event.arguments);
                 }
                 unknown => eprintln!("unknown type: {unknown}"),
             }
@@ -241,13 +266,15 @@ pub fn run() -> Run<()> {
 }
 
 #[derive(Serialize)]
-struct Request<'src> {
+struct HttpRequest<'src> {
     model: &'src str,
     session_id: &'src str,
     stream: bool,
     instructions: &'src str,
     input: Vec<Input<'src>>,
     tools: Vec<Tool<'src>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'src str>,
 }
 
 #[derive(Serialize)]
@@ -256,7 +283,7 @@ struct Tool<'src> {
     ty: ToolType,
     name: &'src str,
     description: &'src str,
-    parameters: serde_json::Value,
+    parameters: Value,
 }
 
 #[derive(Serialize)]
@@ -294,4 +321,115 @@ struct FunctionCall<'src> {
 struct FunctionCallOutput<'src> {
     call_id: &'src str,
     output: &'src str,
+}
+
+#[derive(Deserialize)]
+struct Header<'src> {
+    #[serde(rename = "type")]
+    ty: &'src str,
+}
+
+#[derive(Debug, Deserialize)]
+struct Response<'src> {
+    id: &'src str,
+    model: &'src str,
+    output: Vec<Output<'src>>,
+    error: Option<&'src RawValue>,
+    previous_response_id: Option<&'src str>,
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct ResponseEvent<'src> {
+    #[serde(borrow)]
+    response: Response<'src>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum Output<'src> {
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: &'src str,
+        status: &'src str,
+        #[serde(default)]
+        content: Vec<Content<'src>>,
+        #[serde(default)]
+        summary: Vec<&'src RawValue>,
+    },
+    #[serde(rename = "message")]
+    Message {
+        id: &'src str,
+        status: &'src str,
+        role: &'src str,
+        #[serde(default)]
+        content: Vec<Content<'src>>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        #[expect(dead_code)]
+        id: &'src str,
+        status: &'src str,
+        call_id: &'src str,
+        name: &'src str,
+        arguments: Cow<'src, str>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct Content<'src> {
+    text: Cow<'src, str>,
+    #[serde(borrow, default)]
+    annotations: Vec<&'src RawValue>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct DeltaEvent<'src> {
+    content_index: u64,
+    item_id: &'src str,
+    delta: Cow<'src, str>,
+}
+
+pub trait Provider {
+    fn req(&mut self, req: Request) -> stream::Boxed<Event>;
+}
+
+pub enum Request {
+    Message(String),
+    CallOutput,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Error(Error),
+    Reasoning(Delta),
+    Message(Delta),
+    Call(Call),
+}
+
+#[derive(Debug)]
+pub enum Error {}
+
+#[derive(Debug)]
+pub struct Delta {
+    content_index: u64,
+    item_id: Box<str>,
+    delta: String,
+}
+
+#[derive(Debug)]
+pub struct Call {
+    call_id: Box<str>,
+    name: Box<str>,
+    arguments: String,
 }

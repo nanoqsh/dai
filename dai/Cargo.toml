@@ -13,6 +13,7 @@ name = "dai"
 path = "src/main.rs"
 
 [dependencies]
+futures-lite = { workspace = true, features = ["alloc"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 ureq = { workspace = true, features = ["rustls"] }
