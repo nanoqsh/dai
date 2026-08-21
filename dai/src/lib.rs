@@ -1,9 +1,9 @@
-mod api;
 mod http;
 mod provider;
+mod responses;
 
 use {
-    crate::{api::OpenRouter, provider::*},
+    crate::{provider::*, responses::OpenRouter},
     futures_lite::{StreamExt, future},
     std::error,
 };

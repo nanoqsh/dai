@@ -27,11 +27,16 @@ impl Http {
         &self,
         uri: &str,
         headers: &[(&str, HeaderValue)],
+        queries: &[(&str, &str)],
         body: String,
     ) -> Run<Response> {
         let mut b = self.http.post(uri);
         for (key, value) in headers {
             b = b.header(*key, value);
+        }
+
+        for (key, value) in queries {
+            b = b.query(key, value);
         }
 
         let res = blocking::unblock(|| b.send(body)).await?;

@@ -96,6 +96,7 @@ impl ResponsesApi {
                         ("Authorization", self.auth.clone()),
                         ("Content-Type", HeaderValue::from_static("application/json")),
                     ],
+                    &[],
                     body,
                 )
                 .await?;
@@ -161,6 +162,7 @@ enum Mode {
         inputs: Vec<Box<RawValue>>,
         agent_message: String,
     },
+    #[expect(dead_code)]
     Statefull {
         input: Option<Box<RawValue>>,
         previous_response_id: Box<str>,
@@ -264,9 +266,10 @@ struct Header<'src> {
 #[derive(Debug, Deserialize)]
 struct Response<'src> {
     id: &'src str,
-    model: &'src str,
+    #[expect(dead_code)]
     output: Vec<Output<'src>>,
     error: Option<&'src RawValue>,
+    #[expect(dead_code)]
     previous_response_id: Option<&'src str>,
     usage: Option<Usage>,
 }
@@ -280,18 +283,18 @@ struct ResponseEvent<'src> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum Output<'src> {
+    #[expect(dead_code)]
     #[serde(rename = "reasoning")]
     Reasoning {
-        id: &'src str,
         status: &'src str,
         #[serde(default)]
         content: Vec<Content<'src>>,
         #[serde(default)]
         summary: Vec<&'src RawValue>,
     },
+    #[expect(dead_code)]
     #[serde(rename = "message")]
     Message {
-        id: &'src str,
         status: &'src str,
         role: &'src str,
         #[serde(default)]
@@ -299,8 +302,6 @@ enum Output<'src> {
     },
     #[serde(rename = "function_call")]
     FunctionCall {
-        #[expect(dead_code)]
-        id: &'src str,
         status: &'src str,
         call_id: &'src str,
         name: &'src str,
@@ -310,7 +311,9 @@ enum Output<'src> {
 
 #[derive(Debug, Deserialize)]
 struct Content<'src> {
+    #[expect(dead_code)]
     text: Cow<'src, str>,
+    #[expect(dead_code)]
     #[serde(borrow, default)]
     annotations: Vec<&'src RawValue>,
 }
@@ -336,7 +339,6 @@ struct DeltaEvent<'src> {
 struct DoneEvent<'src> {
     content_index: u64,
     item_id: &'src str,
-    text: Cow<'src, str>,
 }
 
 fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
@@ -348,32 +350,34 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
     match ty {
         "response.created" => {
             let event: ResponseEvent<'_> = serde_json::from_str(s)?;
-            println!("response={:?}", event.response);
             *response_id = event.response.id.into();
         }
-        "response.in_progress" => {
-            let event: ResponseEvent<'_> = serde_json::from_str(s)?;
-            println!("response={:?}", event.response);
-        }
+        "response.in_progress" => {}
         "response.completed" => {
             let event: ResponseEvent<'_> = serde_json::from_str(s)?;
             println!("response={:?}", event.response);
+
+            if let Some(e) = event.response.error {
+                eprintln!("response error: {e}");
+            }
+
+            if let Some(usage) = event.response.usage {
+                println!("usage input tokens: {}", usage.input_tokens);
+                println!("usage output tokens: {}", usage.output_tokens);
+                println!("usage total tokens: {}", usage.total_tokens);
+            }
         }
         "response.output_item.added" => {}
         "response.output_item.done" => {
             #[derive(Deserialize)]
             struct Done<'src> {
-                output_index: u64,
                 #[serde(borrow)]
                 item: Output<'src>,
             }
 
             let event: Done<'_> = serde_json::from_str(s)?;
-            println!("output_index={}", event.output_index);
-            println!("item={:?}", event.item);
 
             if let Output::FunctionCall {
-                id: _,
                 status,
                 call_id,
                 name,
@@ -392,35 +396,15 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
             }
         }
         "response.content_part.added" => {}
-        "response.content_part.done" => {
-            #[derive(Deserialize)]
-            struct Done<'src> {
-                item_id: &'src str,
-                part: &'src RawValue,
-                text: Option<&'src str>,
-            }
-
-            let event: Done<'_> = serde_json::from_str(s)?;
-            println!("item_id={}", event.item_id);
-            println!("part={}", event.part.get());
-            println!("text={:?}", event.text);
-        }
+        "response.content_part.done" => {}
         "response.reasoning_text.delta" => {
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
-            println!("content_index={}", event.content_index);
-            println!("item_id={}", event.item_id);
-            println!("delta={}", event.delta);
-
             return Ok(
                 Delta::new(event.content_index, event.item_id, event.delta).map(Event::Reasoning)
             );
         }
         "response.reasoning_text.done" => {
             let event: DoneEvent<'_> = serde_json::from_str(s)?;
-            println!("content_index={}", event.content_index);
-            println!("item_id={}", event.item_id);
-            println!("text={}", event.text);
-
             return Ok(Some(Event::Reasoning(Delta::done(
                 event.content_index,
                 event.item_id,
@@ -428,51 +412,19 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
         }
         "response.output_text.delta" => {
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
-            println!("content_index={}", event.content_index);
-            println!("item_id={}", event.item_id);
-            println!("delta={}", event.delta);
-
             return Ok(
                 Delta::new(event.content_index, event.item_id, event.delta).map(Event::Message)
             );
         }
         "response.output_text.done" => {
             let event: DoneEvent<'_> = serde_json::from_str(s)?;
-            println!("content_index={}", event.content_index);
-            println!("item_id={}", event.item_id);
-            println!("text={}", event.text);
-
             return Ok(Some(Event::Message(Delta::done(
                 event.content_index,
                 event.item_id,
             ))));
         }
-        "response.function_call_arguments.delta" => {
-            #[derive(Deserialize)]
-            struct Delta<'src> {
-                item_id: &'src str,
-                output_index: u64,
-                delta: Cow<'src, str>,
-            }
-
-            let event: Delta<'_> = serde_json::from_str(s)?;
-            println!("item_id={}", event.item_id);
-            println!("output_index={}", event.output_index);
-            println!("delta={}", event.delta);
-        }
-        "response.function_call_arguments.done" => {
-            #[derive(Deserialize)]
-            struct Done<'src> {
-                item_id: &'src str,
-                output_index: u64,
-                arguments: Cow<'src, str>,
-            }
-
-            let event: Done<'_> = serde_json::from_str(s)?;
-            println!("item_id={}", event.item_id);
-            println!("output_index={}", event.output_index);
-            println!("arguments={}", event.arguments);
-        }
+        "response.function_call_arguments.delta" => {}
+        "response.function_call_arguments.done" => {}
         unknown => eprintln!("unknown type: {unknown}"),
     }
 
