@@ -13,7 +13,9 @@ name = "dai"
 path = "src/main.rs"
 
 [dependencies]
-futures-lite = { workspace = true, features = ["alloc"] }
+async-channel.workspace = true
+blocking.workspace = true
+futures-lite = { workspace = true, features = ["std"] }
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }

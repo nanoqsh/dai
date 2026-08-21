@@ -1,9 +1,17 @@
-use ureq::{
-    Agent, Body, Error,
-    config::Config,
-    http::{HeaderValue, Response},
+use {
+    blocking::Unblock,
+    futures_lite::io::{AsyncRead, BufReader},
+    std::error,
+    ureq::{
+        Agent, BodyReader,
+        config::Config,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    },
 };
 
+type Run<T> = Result<T, Box<dyn error::Error + Send + Sync>>;
+
+#[derive(Clone)]
 pub struct Http {
     http: Agent,
 }
@@ -15,17 +23,43 @@ impl Http {
         Self { http }
     }
 
-    pub fn post(
+    pub async fn post(
         &self,
         uri: &str,
-        headers: &mut dyn Iterator<Item = (&str, HeaderValue)>,
+        headers: &[(&str, HeaderValue)],
         body: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Run<Response> {
         let mut b = self.http.post(uri);
         for (key, value) in headers {
-            b = b.header(key, value);
+            b = b.header(*key, value);
         }
 
-        b.send(body)
+        let res = blocking::unblock(|| b.send(body)).await?;
+        let (parts, body) = res.into_parts();
+        Ok(Response {
+            status: parts.status,
+            headers: parts.headers,
+            body: body.into_reader(),
+        })
+    }
+}
+
+pub struct Response {
+    status: StatusCode,
+    headers: HeaderMap<HeaderValue>,
+    body: BodyReader<'static>,
+}
+
+impl Response {
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap<HeaderValue> {
+        &self.headers
+    }
+
+    pub fn into_reader(self) -> BufReader<impl AsyncRead> {
+        BufReader::new(Unblock::new(self.body))
     }
 }
