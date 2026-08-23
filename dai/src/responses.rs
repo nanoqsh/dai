@@ -1,11 +1,11 @@
 use {
     crate::{Config, Tool, http::Http, provider::*},
-    futures_lite::{AsyncBufReadExt, AsyncReadExt},
+    futures_lite::AsyncBufReadExt,
     rand::RngExt,
     serde::{Deserialize, Serialize},
     serde_json::{Value, value::RawValue},
     std::{borrow::Cow, error, mem},
-    ureq::http::{HeaderValue, StatusCode},
+    ureq::http::HeaderValue,
 };
 
 type Run<T> = Result<T, Box<dyn error::Error + Send + Sync>>;
@@ -100,26 +100,6 @@ impl ResponsesApi {
                     body,
                 )
                 .await?;
-
-            if res.status() != StatusCode::OK {
-                eprintln!("non ok status: {}", res.status());
-                let json = res
-                    .headers()
-                    .get("Content-Type")
-                    .is_some_and(|content_type| content_type == "application/json");
-
-                let mut body = String::new();
-                res.into_reader().read_to_string(&mut body).await?;
-
-                if json {
-                    let body: Value = serde_json::from_str(&body)?;
-                    eprintln!("body: {body:#}");
-                } else {
-                    eprintln!("body: {body}");
-                }
-
-                return Ok(());
-            }
 
             let mut line = String::new();
             let mut read = res.into_reader();
@@ -345,8 +325,6 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
     let Header { ty } =
         serde_json::from_str(s).inspect_err(|_| eprintln!("failed to parse json: {s}"))?;
 
-    println!("=={ty}");
-
     match ty {
         "response.created" => {
             let event: ResponseEvent<'_> = serde_json::from_str(s)?;
@@ -471,9 +449,9 @@ impl Input<'_> {
     fn from_request(req: Request) -> Self {
         match req {
             Request::Message(s) => Self::UserMessage(s),
-            Request::CallOutput { call_id, output } => {
-                Self::CallOutput(FunctionCallOutput { call_id, output })
-            }
+            Request::CallOutput {
+                call_id, output, ..
+            } => Self::CallOutput(FunctionCallOutput { call_id, output }),
         }
     }
 }

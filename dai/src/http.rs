@@ -1,11 +1,12 @@
 use {
     blocking::Unblock,
     futures_lite::io::{AsyncRead, BufReader},
-    std::error,
+    serde_json::Value,
+    std::{error, io::Read},
     ureq::{
         Agent, BodyReader,
         config::Config,
-        http::{HeaderMap, HeaderValue, StatusCode},
+        http::{HeaderValue, StatusCode},
     },
 };
 
@@ -40,30 +41,39 @@ impl Http {
         }
 
         let res = blocking::unblock(|| b.send(body)).await?;
-        let (parts, body) = res.into_parts();
+        if res.status() != StatusCode::OK {
+            eprintln!("non ok status: {}", res.status());
+            let json = res
+                .headers()
+                .get("Content-Type")
+                .is_some_and(|content_type| content_type == "application/json");
+
+            let body = blocking::unblock(|| -> Run<String> {
+                let mut body = String::new();
+                res.into_body().into_reader().read_to_string(&mut body)?;
+                Ok(body)
+            })
+            .await?;
+
+            return if json {
+                let value: Value = serde_json::from_str(&body)?;
+                Err(format!("body: {value:#}").into())
+            } else {
+                Err(format!("body: {body}").into())
+            };
+        }
+
         Ok(Response {
-            status: parts.status,
-            headers: parts.headers,
-            body: body.into_reader(),
+            body: res.into_body().into_reader(),
         })
     }
 }
 
 pub struct Response {
-    status: StatusCode,
-    headers: HeaderMap<HeaderValue>,
     body: BodyReader<'static>,
 }
 
 impl Response {
-    pub fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    pub fn headers(&self) -> &HeaderMap<HeaderValue> {
-        &self.headers
-    }
-
     pub fn into_reader(self) -> BufReader<impl AsyncRead> {
         BufReader::new(Unblock::new(self.body))
     }
