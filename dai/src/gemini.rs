@@ -1,9 +1,9 @@
 use {
-    crate::{Config, http::Http, provider::*},
+    crate::{Config, Tool, http::Http, provider::*},
     futures_lite::AsyncBufReadExt,
     serde::{Deserialize, Serialize},
-    serde_json::Value,
-    std::{borrow::Cow, error},
+    serde_json::{Value, value::RawValue},
+    std::{borrow::Cow, collections::HashMap, error},
     ureq::http::HeaderValue,
 };
 
@@ -13,7 +13,8 @@ pub struct Gemini {
     key: HeaderValue,
     http: Http,
     model: Box<str>,
-    // tools: Box<RawValue>,
+    instructions: Box<str>,
+    tools: Box<RawValue>,
     previous_interaction_id: Box<str>,
 }
 
@@ -22,13 +23,15 @@ impl Gemini {
         let key = HeaderValue::from_str(conf.key)?;
         let http = Http::new();
 
-        // let tools =
-        //    tools_json(conf.tools).map_err(|e| format!("failed to serialize tools: {e}"))?;
+        let tools =
+            tools_json(conf.tools).map_err(|e| format!("failed to serialize tools: {e}"))?;
 
         Ok(Self {
             key,
             http,
-            model: conf.model,
+            model: conf.model.into(),
+            instructions: conf.instructions.into(),
+            tools,
             previous_interaction_id: Box::default(),
         })
     }
@@ -52,8 +55,10 @@ impl Gemini {
 
         let req = HttpRequest {
             model: &self.model,
-            input,
             stream: true,
+            system_instruction: &self.instructions,
+            input,
+            tools: &self.tools,
             previous_interaction_id: if self.previous_interaction_id.is_empty() {
                 None
             } else {
@@ -129,8 +134,10 @@ impl Provider for Gemini {
 #[derive(Serialize)]
 struct HttpRequest<'src> {
     model: &'src str,
-    input: Input<'src>,
     stream: bool,
+    system_instruction: &'src str,
+    input: Input<'src>,
+    tools: &'src RawValue,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_interaction_id: Option<&'src str>,
 }
@@ -171,6 +178,8 @@ fn parse_event(
     previous_interaction_id: &mut Box<str>,
     step: &mut Step,
 ) -> Run<Option<Event>> {
+    println!("[{event}] {s}");
+
     match event {
         "interaction.created" => {
             let event: InteractionEvent<'_> = serde_json::from_str(s)?;
@@ -180,27 +189,54 @@ fn parse_event(
         "interaction.completed" => {}
         "step.start" => {
             #[derive(Deserialize)]
-            struct Event<'src> {
+            struct StepEvent<'src> {
                 #[serde(borrow)]
-                step: StepType<'src>,
+                step: Kind<'src>,
             }
 
             #[derive(Deserialize)]
-            struct StepType<'src> {
-                #[serde(rename = "type")]
-                ty: &'src str,
+            #[serde(tag = "type")]
+            enum Kind<'src> {
+                #[serde(rename = "thought")]
+                Thought,
+                #[serde(rename = "model_output")]
+                ModelOutput,
+                #[serde(rename = "function_call")]
+                FunctionCall {
+                    id: &'src str,
+                    name: &'src str,
+                    arguments: HashMap<Cow<'src, str>, &'src RawValue>,
+                },
+                #[serde(other)]
+                Unknown,
             }
 
-            let event: Event<'_> = serde_json::from_str(s)?;
-            *step = match event.step.ty {
-                "thought" => Step::Thought,
-                "model_output" => Step::ModelOutput,
-                "function_call" => Step::FunctionCall,
-                unknown => {
-                    eprintln!("unknown step type: {unknown}");
+            let event: StepEvent<'_> = serde_json::from_str(s)?;
+            let mut res = None;
+            *step = match event.step {
+                Kind::Thought => Step::Thought,
+                Kind::ModelOutput => Step::ModelOutput,
+                Kind::FunctionCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let arguments = serde_json::to_string(&arguments)?;
+                    res = Some(Event::Call {
+                        id: id.into(),
+                        name: name.into(),
+                        arguments,
+                    });
+
+                    Step::FunctionCall
+                }
+                Kind::Unknown => {
+                    eprintln!("unknown step type");
                     Step::Empty
                 }
             };
+
+            return Ok(res);
         }
         "step.delta" => {
             #[derive(Deserialize)]
@@ -224,7 +260,10 @@ fn parse_event(
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
             match (step, event.delta) {
                 (Step::ModelOutput, DeltaType::Text { text }) => {
-                    return Ok(Delta::new(event.index, "", text).map(Event::Message));
+                    return Ok(Some(Event::Message {
+                        id: Id::from(event.index),
+                        delta: text.into_owned(),
+                    }));
                 }
                 (Step::Thought, DeltaType::ThoughtSignature { signature }) => _ = signature,
                 (_, DeltaType::Unknown) => eprintln!("unknown delta type"),
@@ -236,4 +275,33 @@ fn parse_event(
     }
 
     Ok(None)
+}
+
+fn tools_json(tools: &[Tool]) -> Run<Box<RawValue>> {
+    #[derive(Serialize)]
+    struct WriteTool<'src> {
+        #[serde(rename = "type")]
+        ty: &'static str,
+        name: &'src str,
+        description: &'src str,
+        parameters: Value,
+    }
+
+    let write: Vec<_> = tools
+        .iter()
+        .map(|tool| WriteTool {
+            ty: "function",
+            name: &tool.name,
+            description: &tool.description,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        })
+        .collect();
+
+    let s = serde_json::to_string(&write)?;
+    Ok(RawValue::from_string(s)?)
 }

@@ -4,7 +4,7 @@ use {
     rand::RngExt,
     serde::{Deserialize, Serialize},
     serde_json::{Value, value::RawValue},
-    std::{borrow::Cow, error, mem},
+    std::{borrow::Cow, collections::HashMap, error},
     ureq::http::HeaderValue,
 };
 
@@ -18,7 +18,7 @@ impl OpenRouter {
             conf,
             Mode::Stateless {
                 inputs: vec![],
-                agent_message: String::new(),
+                agent_messages: HashMap::new(),
             },
         )?;
 
@@ -36,6 +36,7 @@ struct ResponsesApi {
     auth: HeaderValue,
     http: Http,
     model: Box<str>,
+    instructions: Box<str>,
     session_id: Box<str>,
     tools: Box<RawValue>,
     mode: Mode,
@@ -60,7 +61,8 @@ impl ResponsesApi {
         Ok(Self {
             auth,
             http,
-            model: conf.model,
+            model: conf.model.into(),
+            instructions: conf.instructions.into(),
             session_id: session_id.into_boxed_str(),
             tools,
             mode,
@@ -76,7 +78,7 @@ impl ResponsesApi {
             model: &self.model,
             session_id: &self.session_id,
             stream: true,
-            instructions: "You are an autonomous agent. You have access to tools. Use tools when necessary to accomplish the user's task. When the task is complete, finish the run",
+            instructions: &self.instructions,
             input: self.mode.inputs(),
             tools: &self.tools,
             previous_response_id: self.mode.previous_response_id(),
@@ -101,6 +103,7 @@ impl ResponsesApi {
                 )
                 .await?;
 
+            let mut items = Items(HashMap::new());
             let mut line = String::new();
             let mut read = res.into_reader();
             while {
@@ -126,12 +129,13 @@ impl ResponsesApi {
                     None => &mut Box::default(),
                 };
 
-                if let Some(event) = parse_event(s, previous_response_id)? {
+                if let Some(event) = parse_event(s, previous_response_id, &mut items)? {
                     self.mode.push_event(&event)?;
                     send.send(event).await;
                 }
             }
 
+            self.mode.commit_agent_messages()?;
             Ok(())
         }))
     }
@@ -140,7 +144,7 @@ impl ResponsesApi {
 enum Mode {
     Stateless {
         inputs: Vec<Box<RawValue>>,
-        agent_message: String,
+        agent_messages: HashMap<Id, String>,
     },
     #[expect(dead_code)]
     Statefull {
@@ -163,34 +167,47 @@ impl Mode {
     fn push_event(&mut self, event: &Event) -> Run<()> {
         let Self::Stateless {
             inputs,
-            agent_message,
+            agent_messages,
         } = self
         else {
             return Ok(());
         };
 
+        if !matches!(event, Event::Message { .. }) {
+            commit_agent_messages(inputs, agent_messages)?;
+        }
+
         match &event {
-            Event::Message(delta) if let Some(s) = delta.delta() => {
-                agent_message.push_str(s);
-            }
-            Event::Message(_) => {
-                let message = mem::take(agent_message);
-                let input = Input::AgentMessage(message);
-                inputs.push(input_json(input)?);
-            }
-            Event::Call(call) => {
+            Event::Message { id, delta } => agent_messages.entry(*id).or_default().push_str(delta),
+            Event::Call {
+                id,
+                name,
+                arguments,
+            } => {
                 let input = Input::Call(FunctionCall {
-                    call_id: &call.call_id,
-                    name: &call.name,
-                    arguments: &call.arguments,
+                    call_id: id,
+                    name,
+                    arguments,
                 });
 
                 inputs.push(input_json(input)?);
             }
-            _ => {}
+            Event::Reasoning { .. } | Event::Error(_) => {}
         }
 
         Ok(())
+    }
+
+    fn commit_agent_messages(&mut self) -> Run<()> {
+        let Self::Stateless {
+            inputs,
+            agent_messages,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        commit_agent_messages(inputs, agent_messages)
     }
 
     fn inputs(&self) -> &[Box<RawValue>] {
@@ -223,6 +240,18 @@ impl Mode {
             } => Some(previous_response_id),
         }
     }
+}
+
+fn commit_agent_messages(
+    inputs: &mut Vec<Box<RawValue>>,
+    agent_messages: &mut HashMap<Id, String>,
+) -> Run<()> {
+    for (_, message) in agent_messages.drain() {
+        let input = Input::AgentMessage(message);
+        inputs.push(input_json(input)?);
+    }
+
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -310,20 +339,24 @@ struct Usage {
 
 #[derive(Deserialize)]
 struct DeltaEvent<'src> {
-    content_index: u64,
     item_id: &'src str,
     delta: Cow<'src, str>,
 }
 
-#[derive(Deserialize)]
-struct DoneEvent<'src> {
-    content_index: u64,
-    item_id: &'src str,
+struct Items(HashMap<Box<str>, Id>);
+
+impl Items {
+    fn get(&mut self, id: &str) -> Id {
+        let new = self.0.len() as u64;
+        *self.0.entry(id.into()).or_insert_with(|| Id::from(new))
+    }
 }
 
-fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
+fn parse_event(s: &str, response_id: &mut Box<str>, items: &mut Items) -> Run<Option<Event>> {
     let Header { ty } =
         serde_json::from_str(s).inspect_err(|_| eprintln!("failed to parse json: {s}"))?;
+
+    println!("[{ty}] {s}");
 
     match ty {
         "response.created" => {
@@ -333,8 +366,6 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
         "response.in_progress" => {}
         "response.completed" => {
             let event: ResponseEvent<'_> = serde_json::from_str(s)?;
-            println!("response={:?}", event.response);
-
             if let Some(e) = event.response.error {
                 eprintln!("response error: {e}");
             }
@@ -366,41 +397,31 @@ fn parse_event(s: &str, response_id: &mut Box<str>) -> Run<Option<Event>> {
                     eprintln!("status should be completed, but it's {status}");
                 }
 
-                return Ok(Some(Event::Call(Call {
-                    call_id: call_id.into(),
+                return Ok(Some(Event::Call {
+                    id: call_id.into(),
                     name: name.into(),
                     arguments: arguments.into_owned(),
-                })));
+                }));
             }
         }
         "response.content_part.added" => {}
         "response.content_part.done" => {}
         "response.reasoning_text.delta" => {
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
-            return Ok(
-                Delta::new(event.content_index, event.item_id, event.delta).map(Event::Reasoning)
-            );
+            return Ok(Some(Event::Reasoning {
+                id: items.get(event.item_id),
+                delta: event.delta.into_owned(),
+            }));
         }
-        "response.reasoning_text.done" => {
-            let event: DoneEvent<'_> = serde_json::from_str(s)?;
-            return Ok(Some(Event::Reasoning(Delta::done(
-                event.content_index,
-                event.item_id,
-            ))));
-        }
+        "response.reasoning_text.done" => {}
         "response.output_text.delta" => {
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
-            return Ok(
-                Delta::new(event.content_index, event.item_id, event.delta).map(Event::Message)
-            );
+            return Ok(Some(Event::Message {
+                id: items.get(event.item_id),
+                delta: event.delta.into_owned(),
+            }));
         }
-        "response.output_text.done" => {
-            let event: DoneEvent<'_> = serde_json::from_str(s)?;
-            return Ok(Some(Event::Message(Delta::done(
-                event.content_index,
-                event.item_id,
-            ))));
-        }
+        "response.output_text.done" => {}
         "response.function_call_arguments.delta" => {}
         "response.function_call_arguments.done" => {}
         unknown => eprintln!("unknown type: {unknown}"),
@@ -450,7 +471,9 @@ impl Input<'_> {
         match req {
             Request::Message(s) => Self::UserMessage(s),
             Request::CallOutput {
-                call_id, output, ..
+                id: call_id,
+                output,
+                ..
             } => Self::CallOutput(FunctionCallOutput { call_id, output }),
         }
     }

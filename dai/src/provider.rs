@@ -45,30 +45,45 @@ pub trait Provider {
 pub enum Request {
     Message(String),
     CallOutput {
-        call_id: Box<str>,
+        id: Box<str>,
         name: Box<str>,
         output: Box<str>,
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Id(u64);
+
+impl From<u64> for Id {
+    fn from(u: u64) -> Self {
+        Self(u)
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Error(Error),
-    Reasoning(Delta),
-    Message(Delta),
-    Call(Call),
+    Reasoning {
+        id: Id,
+        delta: String,
+    },
+    Message {
+        id: Id,
+        delta: String,
+    },
+    Call {
+        id: Box<str>,
+        name: Box<str>,
+        arguments: String,
+    },
 }
 
 #[derive(Debug)]
-pub enum Error {
-    Std(Box<dyn error::Error + Send + Sync>),
-}
+pub struct Error(Box<dyn error::Error + Send + Sync>);
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Std(s) => s.fmt(f),
-        }
+        self.0.fmt(f)
     }
 }
 
@@ -77,58 +92,6 @@ where
     E: Into<Box<dyn error::Error + Send + Sync>>,
 {
     fn from(e: E) -> Self {
-        Self::Std(e.into())
+        Self(e.into())
     }
-}
-
-#[derive(Debug)]
-pub struct Delta {
-    content_index: u64,
-    item_id: Box<str>,
-    delta: String,
-}
-
-impl Delta {
-    pub fn new<I, D>(content_index: u64, item_id: I, delta: D) -> Option<Self>
-    where
-        I: Into<Box<str>>,
-        D: Into<String>,
-    {
-        let delta = delta.into();
-        if delta.is_empty() {
-            None
-        } else {
-            Some(Self {
-                content_index,
-                item_id: item_id.into(),
-                delta,
-            })
-        }
-    }
-
-    pub fn done<I>(content_index: u64, item_id: I) -> Self
-    where
-        I: Into<Box<str>>,
-    {
-        Self {
-            content_index,
-            item_id: item_id.into(),
-            delta: String::new(),
-        }
-    }
-
-    pub fn delta(&self) -> Option<&str> {
-        if self.delta.is_empty() {
-            None
-        } else {
-            Some(&self.delta)
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Call {
-    pub call_id: Box<str>,
-    pub name: Box<str>,
-    pub arguments: String,
 }
