@@ -1,5 +1,6 @@
 use {
     futures_lite::stream::{self, Stream},
+    serde_json::value::RawValue,
     std::{error, fmt, future, pin::Pin},
 };
 
@@ -44,11 +45,13 @@ pub trait Provider {
 
 pub enum Request {
     Message(String),
-    CallOutput {
-        id: Box<str>,
-        name: Box<str>,
-        output: Box<str>,
-    },
+    CallOutputs(Vec<CallOutput>),
+}
+
+pub struct CallOutput {
+    pub id: Box<str>,
+    pub name: Box<str>,
+    pub output: Box<RawValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,7 +77,7 @@ pub enum Event {
     Call {
         id: Box<str>,
         name: Box<str>,
-        arguments: String,
+        arguments: Box<RawValue>,
     },
 }
 

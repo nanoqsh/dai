@@ -1,8 +1,8 @@
 use {
-    crate::{Config, Tool, http::Http, provider::*},
+    crate::{Config, http::Http, provider::*},
     futures_lite::AsyncBufReadExt,
     serde::{Deserialize, Serialize},
-    serde_json::{Value, value::RawValue},
+    serde_json::value::RawValue,
     std::{borrow::Cow, collections::HashMap, error},
     ureq::http::HeaderValue,
 };
@@ -23,8 +23,10 @@ impl Gemini {
         let key = HeaderValue::from_str(conf.key)?;
         let http = Http::new();
 
-        let tools =
-            tools_json(conf.tools).map_err(|e| format!("failed to serialize tools: {e}"))?;
+        let tools = conf
+            .tools
+            .to_json()
+            .map_err(|e| format!("failed to serialize tools: {e}"))?;
 
         Ok(Self {
             key,
@@ -39,18 +41,16 @@ impl Gemini {
     fn req(&mut self, req: Request) -> Events<'_> {
         let input = match &req {
             Request::Message(message) => Input::Text(message),
-            Request::CallOutput { name, output, .. } => {
-                let result = match serde_json::from_str(output) {
-                    Ok(result) => result,
-                    Err(e) => return error(e),
-                };
-
-                Input::FunctionResult {
-                    ty: "function_result",
-                    name,
-                    result,
-                }
-            }
+            Request::CallOutputs(outputs) => Input::FunctionResults(
+                outputs
+                    .iter()
+                    .map(|o| FunctionResult {
+                        ty: "function_result",
+                        name: &o.name,
+                        result: &o.output,
+                    })
+                    .collect(),
+            ),
         };
 
         let req = HttpRequest {
@@ -85,7 +85,7 @@ impl Gemini {
                 )
                 .await?;
 
-            let mut step = Step::Empty;
+            let mut steps = Steps(HashMap::new());
             let mut event = String::new();
             let mut line = String::new();
             let mut read = res.into_reader();
@@ -114,7 +114,7 @@ impl Gemini {
                 };
 
                 if let Some(event) =
-                    parse_event(s, &event, &mut self.previous_interaction_id, &mut step)?
+                    parse_event(s, &event, &mut self.previous_interaction_id, &mut steps)?
                 {
                     send.send(event).await;
                 }
@@ -146,12 +146,15 @@ struct HttpRequest<'src> {
 #[serde(untagged)]
 enum Input<'src> {
     Text(&'src str),
-    FunctionResult {
-        #[serde(rename = "type")]
-        ty: &'static str,
-        name: &'src str,
-        result: Value,
-    },
+    FunctionResults(Vec<FunctionResult<'src>>),
+}
+
+#[derive(Serialize)]
+struct FunctionResult<'src> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    name: &'src str,
+    result: &'src RawValue,
 }
 
 #[derive(Deserialize)]
@@ -166,17 +169,36 @@ struct Interaction<'src> {
 }
 
 enum Step {
-    Empty,
     Thought,
     ModelOutput,
-    FunctionCall,
+    FunctionCall {
+        id: Box<str>,
+        name: Box<str>,
+        arguments: String,
+    },
+}
+
+struct Steps(HashMap<Id, Step>);
+
+impl Steps {
+    fn insert(&mut self, id: Id, step: Step) {
+        self.0.insert(id, step);
+    }
+
+    fn get(&mut self, id: Id) -> Option<&mut Step> {
+        self.0.get_mut(&id)
+    }
+
+    fn remove(&mut self, id: Id) -> Option<Step> {
+        self.0.remove(&id)
+    }
 }
 
 fn parse_event(
     s: &str,
     event: &str,
     previous_interaction_id: &mut Box<str>,
-    step: &mut Step,
+    steps: &mut Steps,
 ) -> Run<Option<Event>> {
     println!("[{event}] {s}");
 
@@ -189,7 +211,8 @@ fn parse_event(
         "interaction.completed" => {}
         "step.start" => {
             #[derive(Deserialize)]
-            struct StepEvent<'src> {
+            struct StartEvent<'src> {
+                index: u64,
                 #[serde(borrow)]
                 step: Kind<'src>,
             }
@@ -205,15 +228,15 @@ fn parse_event(
                 FunctionCall {
                     id: &'src str,
                     name: &'src str,
-                    arguments: HashMap<Cow<'src, str>, &'src RawValue>,
+                    arguments: HashMap<Box<str>, Box<RawValue>>,
                 },
                 #[serde(other)]
                 Unknown,
             }
 
-            let event: StepEvent<'_> = serde_json::from_str(s)?;
-            let mut res = None;
-            *step = match event.step {
+            let event: StartEvent<'_> = serde_json::from_str(s)?;
+            let id = Id::from(event.index);
+            let step = match event.step {
                 Kind::Thought => Step::Thought,
                 Kind::ModelOutput => Step::ModelOutput,
                 Kind::FunctionCall {
@@ -221,22 +244,22 @@ fn parse_event(
                     name,
                     arguments,
                 } => {
-                    let arguments = serde_json::to_string(&arguments)?;
-                    res = Some(Event::Call {
+                    let arguments = if arguments.is_empty() {
+                        String::new()
+                    } else {
+                        serde_json::to_string(&arguments)?
+                    };
+
+                    Step::FunctionCall {
                         id: id.into(),
                         name: name.into(),
                         arguments,
-                    });
-
-                    Step::FunctionCall
+                    }
                 }
-                Kind::Unknown => {
-                    eprintln!("unknown step type");
-                    Step::Empty
-                }
+                Kind::Unknown => return Err("unknown step type".into()),
             };
 
-            return Ok(res);
+            steps.insert(id, step);
         }
         "step.delta" => {
             #[derive(Deserialize)]
@@ -253,55 +276,63 @@ fn parse_event(
                 Text { text: Cow<'src, str> },
                 #[serde(rename = "thought_signature")]
                 ThoughtSignature { signature: &'src str },
+                #[serde(rename = "arguments_delta")]
+                Arguments { arguments: Cow<'src, str> },
                 #[serde(other)]
                 Unknown,
             }
 
             let event: DeltaEvent<'_> = serde_json::from_str(s)?;
+            let id = Id::from(event.index);
+            let Some(step) = steps.get(id) else {
+                return Err(format!("no step with index {}", event.index).into());
+            };
+
             match (step, event.delta) {
+                (Step::Thought, DeltaType::ThoughtSignature { signature }) => _ = signature,
                 (Step::ModelOutput, DeltaType::Text { text }) => {
                     return Ok(Some(Event::Message {
-                        id: Id::from(event.index),
+                        id,
                         delta: text.into_owned(),
                     }));
                 }
-                (Step::Thought, DeltaType::ThoughtSignature { signature }) => _ = signature,
-                (_, DeltaType::Unknown) => eprintln!("unknown delta type"),
-                _ => {}
+                (
+                    Step::FunctionCall { arguments, .. },
+                    DeltaType::Arguments { arguments: delta },
+                ) => arguments.push_str(&delta),
+                _ => eprintln!("unknown step types"),
             }
         }
-        "step.stop" => {}
+        "step.stop" => {
+            #[derive(Deserialize)]
+            struct StopEvent {
+                index: u64,
+            }
+
+            let event: StopEvent = serde_json::from_str(s)?;
+            let id = Id::from(event.index);
+            if let Some(Step::FunctionCall {
+                id,
+                name,
+                arguments,
+            }) = steps.remove(id)
+            {
+                let arguments = if arguments.is_empty() {
+                    String::from("{}")
+                } else {
+                    arguments
+                };
+
+                let arguments = RawValue::from_string(arguments)?;
+                return Ok(Some(Event::Call {
+                    id,
+                    name,
+                    arguments,
+                }));
+            }
+        }
         unknown => eprintln!("unknown event: {unknown}"),
     }
 
     Ok(None)
-}
-
-fn tools_json(tools: &[Tool]) -> Run<Box<RawValue>> {
-    #[derive(Serialize)]
-    struct WriteTool<'src> {
-        #[serde(rename = "type")]
-        ty: &'static str,
-        name: &'src str,
-        description: &'src str,
-        parameters: Value,
-    }
-
-    let write: Vec<_> = tools
-        .iter()
-        .map(|tool| WriteTool {
-            ty: "function",
-            name: &tool.name,
-            description: &tool.description,
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }),
-        })
-        .collect();
-
-    let s = serde_json::to_string(&write)?;
-    Ok(RawValue::from_string(s)?)
 }

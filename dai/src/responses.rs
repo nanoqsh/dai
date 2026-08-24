@@ -1,9 +1,9 @@
 use {
-    crate::{Config, Tool, http::Http, provider::*},
+    crate::{Config, http::Http, provider::*},
     futures_lite::AsyncBufReadExt,
     rand::RngExt,
     serde::{Deserialize, Serialize},
-    serde_json::{Value, value::RawValue},
+    serde_json::value::RawValue,
     std::{borrow::Cow, collections::HashMap, error},
     ureq::http::HeaderValue,
 };
@@ -55,8 +55,10 @@ impl ResponsesApi {
             .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
             .collect();
 
-        let tools =
-            tools_json(conf.tools).map_err(|e| format!("failed to serialize tools: {e}"))?;
+        let tools = conf
+            .tools
+            .to_json()
+            .map_err(|e| format!("failed to serialize tools: {e}"))?;
 
         Ok(Self {
             auth,
@@ -148,19 +150,16 @@ enum Mode {
     },
     #[expect(dead_code)]
     Statefull {
-        input: Option<Box<RawValue>>,
+        inputs: Vec<Box<RawValue>>,
         previous_response_id: Box<str>,
     },
 }
 
 impl Mode {
     fn push_request(&mut self, req: Request) -> Run<()> {
-        let value = input_json(Input::from_request(req))?;
-        match self {
-            Self::Stateless { inputs, .. } => inputs.push(value),
-            Self::Statefull { input, .. } => _ = input.insert(value),
-        }
-
+        let value = input_json(Input::from_request(req)?)?;
+        let (Self::Stateless { inputs, .. } | Self::Statefull { inputs, .. }) = self;
+        inputs.extend(value);
         Ok(())
     }
 
@@ -184,13 +183,15 @@ impl Mode {
                 name,
                 arguments,
             } => {
+                let (id, call_id) = id.split_once(':').ok_or("invalid id")?;
                 let input = Input::Call(FunctionCall {
-                    call_id: id,
+                    id,
+                    call_id,
                     name,
-                    arguments,
+                    arguments: arguments.get(),
                 });
 
-                inputs.push(input_json(input)?);
+                inputs.extend(input_json(input)?);
             }
             Event::Reasoning { .. } | Event::Error(_) => {}
         }
@@ -211,10 +212,8 @@ impl Mode {
     }
 
     fn inputs(&self) -> &[Box<RawValue>] {
-        match self {
-            Self::Stateless { inputs, .. } => inputs,
-            Self::Statefull { input, .. } => input.as_slice(),
-        }
+        let (Self::Stateless { inputs, .. } | Self::Statefull { inputs, .. }) = self;
+        inputs
     }
 
     fn previous_response_id(&self) -> Option<&str> {
@@ -248,7 +247,7 @@ fn commit_agent_messages(
 ) -> Run<()> {
     for (_, message) in agent_messages.drain() {
         let input = Input::AgentMessage(message);
-        inputs.push(input_json(input)?);
+        inputs.extend(input_json(input)?);
     }
 
     Ok(())
@@ -311,6 +310,7 @@ enum Output<'src> {
     },
     #[serde(rename = "function_call")]
     FunctionCall {
+        id: &'src str,
         status: &'src str,
         call_id: &'src str,
         name: &'src str,
@@ -387,6 +387,7 @@ fn parse_event(s: &str, response_id: &mut Box<str>, items: &mut Items) -> Run<Op
             let event: Done<'_> = serde_json::from_str(s)?;
 
             if let Output::FunctionCall {
+                id,
                 status,
                 call_id,
                 name,
@@ -398,9 +399,9 @@ fn parse_event(s: &str, response_id: &mut Box<str>, items: &mut Items) -> Run<Op
                 }
 
                 return Ok(Some(Event::Call {
-                    id: call_id.into(),
+                    id: format!("{id}:{call_id}").into_boxed_str(),
                     name: name.into(),
-                    arguments: arguments.into_owned(),
+                    arguments: RawValue::from_string(arguments.into_owned())?,
                 }));
             }
         }
@@ -430,51 +431,29 @@ fn parse_event(s: &str, response_id: &mut Box<str>, items: &mut Items) -> Run<Op
     Ok(None)
 }
 
-fn tools_json(tools: &[Tool]) -> Run<Box<RawValue>> {
-    #[derive(Serialize)]
-    struct WriteTool<'src> {
-        #[serde(rename = "type")]
-        ty: &'static str,
-        name: &'src str,
-        description: &'src str,
-        parameters: Value,
-    }
-
-    let write: Vec<_> = tools
-        .iter()
-        .map(|tool| WriteTool {
-            ty: "function",
-            name: &tool.name,
-            description: &tool.description,
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }),
-        })
-        .collect();
-
-    let s = serde_json::to_string(&write)?;
-    Ok(RawValue::from_string(s)?)
-}
-
 enum Input<'src> {
     UserMessage(String),
     AgentMessage(String),
-    CallOutput(FunctionCallOutput),
+    CallOutputs(Vec<FunctionCallOutput>),
     Call(FunctionCall<'src>),
 }
 
 impl Input<'_> {
-    fn from_request(req: Request) -> Self {
+    fn from_request(req: Request) -> Run<Self> {
         match req {
-            Request::Message(s) => Self::UserMessage(s),
-            Request::CallOutput {
-                id: call_id,
-                output,
-                ..
-            } => Self::CallOutput(FunctionCallOutput { call_id, output }),
+            Request::Message(s) => Ok(Self::UserMessage(s)),
+            Request::CallOutputs(outputs) => Ok(Self::CallOutputs(
+                outputs
+                    .into_iter()
+                    .map(|o| -> Run<_> {
+                        let (_, call_id) = o.id.split_once(':').ok_or("invalid id")?;
+                        Ok(FunctionCallOutput {
+                            call_id: call_id.into(),
+                            output: o.output.get().into(),
+                        })
+                    })
+                    .collect::<Run<_>>()?,
+            )),
         }
     }
 }
@@ -487,12 +466,13 @@ struct FunctionCallOutput {
 
 #[derive(Serialize)]
 struct FunctionCall<'src> {
+    id: &'src str,
     call_id: &'src str,
     name: &'src str,
     arguments: &'src str,
 }
 
-fn input_json(input: Input<'_>) -> Run<Box<RawValue>> {
+fn input_json(input: Input<'_>) -> Run<Vec<Box<RawValue>>> {
     #[derive(Serialize)]
     #[serde(tag = "type")]
     enum WriteInput<'src> {
@@ -511,20 +491,28 @@ fn input_json(input: Input<'_>) -> Run<Box<RawValue>> {
         Assistant,
     }
 
-    let s = match input {
-        Input::UserMessage(s) => serde_json::to_string(&WriteInput::Message {
-            role: Role::User,
-            content: &s,
-        })?,
-        Input::AgentMessage(s) => serde_json::to_string(&WriteInput::Message {
-            role: Role::Assistant,
-            content: &s,
-        })?,
-        Input::CallOutput(output) => {
-            serde_json::to_string(&WriteInput::FunctionCallOutput(output))?
-        }
-        Input::Call(call) => serde_json::to_string(&WriteInput::FunctionCall(call))?,
+    let one = |w| {
+        let s = serde_json::to_string(&w)?;
+        let json = RawValue::from_string(s)?;
+        Ok(vec![json])
     };
 
-    Ok(RawValue::from_string(s)?)
+    match input {
+        Input::UserMessage(s) => one(WriteInput::Message {
+            role: Role::User,
+            content: &s,
+        }),
+        Input::AgentMessage(s) => one(WriteInput::Message {
+            role: Role::Assistant,
+            content: &s,
+        }),
+        Input::CallOutputs(outputs) => outputs
+            .into_iter()
+            .map(|o| {
+                let s = serde_json::to_string(&WriteInput::FunctionCallOutput(o))?;
+                Ok(RawValue::from_string(s)?)
+            })
+            .collect(),
+        Input::Call(call) => one(WriteInput::FunctionCall(call)),
+    }
 }
