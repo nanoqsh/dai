@@ -17,6 +17,7 @@ dai = { version = "=0.0.1", path = "dai" }
 async-channel = "2.5.0"
 blocking = "1.6.2"
 futures-lite = { version = "2.6.1", default-features = false }
+nix = "0.31"
 rand = "0.10.2"
 serde = "1.0.229"
 serde_json = "1.0.151"

@@ -2,7 +2,7 @@ use {
     crate::{Config, http::Http, provider::*},
     futures_lite::AsyncBufReadExt,
     serde::{Deserialize, Serialize},
-    serde_json::value::RawValue,
+    serde_json::{Map, Value, value::RawValue},
     std::{borrow::Cow, collections::HashMap, error},
     ureq::http::HeaderValue,
 };
@@ -154,7 +154,7 @@ struct FunctionResult<'src> {
     #[serde(rename = "type")]
     ty: &'static str,
     name: &'src str,
-    result: &'src RawValue,
+    result: &'src Value,
 }
 
 #[derive(Deserialize)]
@@ -317,19 +317,28 @@ fn parse_event(
                 arguments,
             }) = steps.remove(id)
             {
-                let arguments = if arguments.is_empty() {
-                    String::from("{}")
+                let args = if arguments.is_empty() {
+                    Value::Object(Map::new())
                 } else {
-                    arguments
+                    serde_json::from_str(&arguments)?
                 };
 
-                let arguments = RawValue::from_string(arguments)?;
-                return Ok(Some(Event::Call {
-                    id,
-                    name,
-                    arguments,
-                }));
+                return Ok(Some(Event::Call { id, name, args }));
             }
+        }
+        "error" => {
+            #[derive(Deserialize)]
+            struct ErrorEvent {
+                error: ErrorMessage,
+            }
+
+            #[derive(Deserialize)]
+            struct ErrorMessage {
+                message: String,
+            }
+
+            let event: ErrorEvent = serde_json::from_str(s)?;
+            return Ok(Some(Event::Error(Error::from(event.error.message))));
         }
         unknown => eprintln!("unknown event: {unknown}"),
     }

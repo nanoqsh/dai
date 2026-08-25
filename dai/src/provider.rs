@@ -1,6 +1,6 @@
 use {
     futures_lite::stream::{self, Stream},
-    serde_json::value::RawValue,
+    serde_json::Value,
     std::{error, fmt, future, pin::Pin},
 };
 
@@ -51,7 +51,7 @@ pub enum Request {
 pub struct CallOutput {
     pub id: Box<str>,
     pub name: Box<str>,
-    pub output: Box<RawValue>,
+    pub output: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,7 +77,7 @@ pub enum Event {
     Call {
         id: Box<str>,
         name: Box<str>,
-        arguments: Box<RawValue>,
+        args: Value,
     },
 }
 

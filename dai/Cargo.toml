@@ -21,5 +21,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 ureq = { workspace = true, features = ["rustls"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
+
 [lints]
 workspace = true

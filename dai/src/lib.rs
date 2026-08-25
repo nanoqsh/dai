@@ -1,17 +1,22 @@
 mod gemini;
+mod handler;
 mod http;
 mod provider;
 mod responses;
 
 use {
-    crate::{gemini::Gemini, provider::*, responses::OpenRouter},
+    crate::{gemini::Gemini, handler::Call, provider::*, responses::OpenRouter},
     futures_lite::{StreamExt, future},
     serde::Serialize,
-    serde_json::value::RawValue,
+    serde_json::{Map, Value, value::RawValue},
     std::{
         collections::HashMap,
-        env, error, fs,
-        path::{Component, Path},
+        env::{self, VarError},
+        error,
+        fmt::Write,
+        fs,
+        path::Path,
+        pin::Pin,
     },
 };
 
@@ -22,15 +27,13 @@ pub fn main() -> Run<()> {
 }
 
 async fn run() -> Run<()> {
-    let instructions = "You are an autonomous agent. You have access to tools. Use tools when necessary to accomplish the user's task. When the task is complete, finish the run";
-
     let path_parameter = Parameter {
         name: "path".into(),
         description: "Relative file path".into(),
         ty: PrimitiveType::String,
     };
 
-    let tools = Tools::new([
+    let tools = &Tools::new([
         Tool {
             name: "fs.read".into(),
             description: "Read a text file from the agent's working directory".into(),
@@ -51,13 +54,14 @@ async fn run() -> Run<()> {
         },
     ]);
 
+    let instructions = &instructions();
     let mut provider: Box<dyn Provider> = if false {
         let key = env!("GEMINI_API_KEY");
         let conf = Config {
             key,
             model: "gemini-3.6-flash",
             instructions,
-            tools: &tools,
+            tools,
         };
 
         Box::new(Gemini::new(conf)?)
@@ -67,7 +71,7 @@ async fn run() -> Run<()> {
             key,
             model: "openai/gpt-oss-120b",
             instructions,
-            tools: &tools,
+            tools,
         };
 
         Box::new(OpenRouter::new(conf)?)
@@ -84,12 +88,8 @@ async fn run() -> Run<()> {
                 Event::Error(e) => println!("event error: {e}"),
                 Event::Reasoning { id, delta } => println!("event reasoning ({id:?}): {delta}"),
                 Event::Message { id, delta } => println!("event message ({id:?}): {delta}"),
-                Event::Call {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    println!("event call ({id}): {name} {arguments}");
+                Event::Call { id, name, args } => {
+                    println!("event call ({id}): {name} {args}");
 
                     let Some(tool) = tools.get(&name) else {
                         eprintln!("no tool with name: {name}");
@@ -97,37 +97,27 @@ async fn run() -> Run<()> {
                     };
 
                     if tool.name.as_ref() == "fs.write" {
-                        let arguments = serde_json::to_value(arguments)?;
-                        let path = arguments["path"].as_str().unwrap_or_default();
-                        let content = arguments["content"].as_str().unwrap_or_default();
+                        let func: Pin<Box<dyn Future<Output = Call<Value>>>> = Box::pin(async {
+                            handler::args(&args, &["path", "content"])
+                                .call(fs_write)
+                                .await
+                        });
 
-                        let path = Path::new(path);
-                        if path.is_absolute() {
-                            eprintln!("path is absolute: {}", path.display());
-                            continue;
-                        }
+                        let call_output = match func.await {
+                            Ok(output) => CallOutput { id, name, output },
+                            Err(e) => CallOutput {
+                                id,
+                                name,
+                                output: Value::Object({
+                                    let mut map = Map::new();
+                                    map.insert("error".into(), Value::String(e));
+                                    map
+                                }),
+                            },
+                        };
 
-                        for component in path.components() {
-                            match component {
-                                Component::Prefix(_) => return Err("prefix".into()),
-                                Component::RootDir => return Err("root".into()),
-                                Component::CurDir => return Err("curdir".into()),
-                                Component::ParentDir => return Err("parentdir".into()),
-                                Component::Normal(_) => {}
-                            }
-                        }
-
-                        let hostdir = env::current_dir()?.join(path);
-                        if let Some(parent) = hostdir.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-
-                        fs::write(hostdir, content)?;
-                        req = Some(Request::CallOutputs(vec![CallOutput {
-                            id,
-                            name,
-                            output: RawValue::from_string(String::from("{}"))?,
-                        }]));
+                        // TODO
+                        req = Some(Request::CallOutputs(vec![call_output]));
                     }
                 }
             }
@@ -135,6 +125,10 @@ async fn run() -> Run<()> {
     }
 
     Ok(())
+}
+
+async fn fs_write(path: &Path, content: &str) -> Call<()> {
+    fs::write(path, content).map_err(|e| format!("failed to write in file {}: {e}", path.display()))
 }
 
 pub struct Tool {
@@ -259,4 +253,47 @@ pub struct Config<'scope> {
     model: &'scope str,
     instructions: &'scope str,
     tools: &'scope Tools,
+}
+
+fn instructions() -> String {
+    let mut s = String::from(
+        "[BASIC]\nYou are an autonomous agent. You have access to listed tools. Use tools when necessary to accomplish the user's task. Do not call unlisted tools. When the task is complete, finish the run",
+    );
+
+    let username = username();
+    let userinfo = [
+        Some(("os", env::consts::OS)),
+        username.as_deref().map(|name| ("username", name)),
+    ]
+    .into_iter()
+    .flatten();
+
+    _ = write!(&mut s, "\n[USERINFO]");
+    for (key, value) in userinfo {
+        _ = write!(&mut s, "\n{key}: {value}");
+    }
+
+    s
+}
+
+fn username() -> Option<String> {
+    match env::var("USER") {
+        Ok(name) => return Some(name),
+        Err(VarError::NotPresent) => {}
+        Err(VarError::NotUnicode(_)) => return None,
+    }
+
+    cfg_select! {
+        unix => {
+            use nix::unistd::{User, Uid};
+
+            let uid = Uid::current();
+            if let Some(user) = User::from_uid(uid).ok().flatten() {
+                return Some(user.name);
+            }
+        }
+        _ => {}
+    }
+
+    None
 }

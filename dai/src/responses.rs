@@ -178,17 +178,14 @@ impl Mode {
 
         match &event {
             Event::Message { id, delta } => agent_messages.entry(*id).or_default().push_str(delta),
-            Event::Call {
-                id,
-                name,
-                arguments,
-            } => {
+            Event::Call { id, name, args } => {
                 let (id, call_id) = id.split_once(':').ok_or("invalid id")?;
+                let args = serde_json::to_string(args)?;
                 let input = Input::Call(FunctionCall {
                     id,
                     call_id,
                     name,
-                    arguments: arguments.get(),
+                    arguments: &args,
                 });
 
                 inputs.extend(input_json(input)?);
@@ -401,7 +398,7 @@ fn parse_event(s: &str, response_id: &mut Box<str>, items: &mut Items) -> Run<Op
                 return Ok(Some(Event::Call {
                     id: format!("{id}:{call_id}").into_boxed_str(),
                     name: name.into(),
-                    arguments: RawValue::from_string(arguments.into_owned())?,
+                    args: serde_json::from_str(&arguments)?,
                 }));
             }
         }
@@ -449,7 +446,7 @@ impl Input<'_> {
                         let (_, call_id) = o.id.split_once(':').ok_or("invalid id")?;
                         Ok(FunctionCallOutput {
                             call_id: call_id.into(),
-                            output: o.output.get().into(),
+                            output: o.output.to_string(),
                         })
                     })
                     .collect::<Run<_>>()?,
@@ -461,7 +458,7 @@ impl Input<'_> {
 #[derive(Serialize)]
 struct FunctionCallOutput {
     call_id: Box<str>,
-    output: Box<str>,
+    output: String,
 }
 
 #[derive(Serialize)]
