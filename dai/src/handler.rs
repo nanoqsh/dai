@@ -1,163 +1,130 @@
 use {
     serde_json::{Map, Value},
     std::{
-        convert::Infallible,
         env, fs,
         path::{Component, Path, PathBuf},
+        pin::Pin,
     },
 };
 
 pub type Call<T> = Result<T, String>;
 
-pub fn args<'val, A>(args: &'val Value, names: &'static [&'static str]) -> Arguments<'val, A>
+pub type Func = Box<dyn Fn(&Value) -> Pin<Box<dyn Future<Output = Call<Value>> + '_>>>;
+
+pub fn make<H, T, const N: usize>(handler: H, names: &'static [&'static str; N]) -> Func
 where
-    A: Default,
+    H: Handler<T> + Clone + 'static,
 {
-    let a = A::default();
-    Arguments { args, names, a }
+    const { assert!(H::N == N, "each argument must be named") };
+
+    Box::new(move |value| {
+        let handler = handler.clone();
+        Box::pin(async {
+            handler.call(Arguments { args: value, names }).await?;
+            Ok(Value::Object(Map::new()))
+        })
+    })
 }
 
-pub struct Arguments<'val, A> {
+pub struct Arguments<'val> {
     args: &'val Value,
     names: &'static [&'static str],
-    a: A,
 }
 
-impl<'val, A> Arguments<'val, A> {
-    pub async fn call<H, T>(&'val mut self, handler: H) -> Call<Value>
-    where
-        H: Handler<'val, T, Alloc = A>,
-    {
-        handler.call(self).await?;
-        Ok(Value::Object(Map::new()))
+pub trait Handler<T> {
+    const N: usize;
+    async fn call(self, args: Arguments<'_>) -> Call<()>;
+}
+
+impl<F> Handler<fn()> for F
+where
+    F: AsyncFnOnce() -> Call<()>,
+{
+    const N: usize = 0;
+
+    async fn call(self, _: Arguments<'_>) -> Call<()> {
+        (self)().await?;
+        Ok(())
     }
 }
 
-pub trait Handler<'val, T> {
-    type Alloc: Default + 'static;
-    async fn call(self, args: &'val mut Arguments<'val, Self::Alloc>) -> Call<()>;
-}
-
-impl<'val, A, F> Handler<'val, (A,)> for F
+impl<A, F> Handler<fn(A)> for F
 where
-    A: FromValue<'val>,
-    F: AsyncFnOnce(A) -> Call<()>,
+    A: FromValue + ?Sized,
+    F: AsyncFnOnce(A::Me<'_>) -> Call<()>,
 {
-    type Alloc = (Alloc<A::Alloc>,);
+    const N: usize = 1;
 
-    async fn call(self, args: &'val mut Arguments<'val, Self::Alloc>) -> Call<()> {
-        let a = <A>::from_value(args.args, args.names[0], &mut args.a.0)?;
+    async fn call(self, args: Arguments<'_>) -> Call<()> {
+        let a = <A>::from_value(args.args, args.names[0])?;
         (self)(a).await?;
         Ok(())
     }
 }
 
-impl<'val, A, B, F> Handler<'val, (A, B)> for F
+impl<A, B, F> Handler<fn(A, B)> for F
 where
-    A: FromValue<'val>,
-    B: FromValue<'val>,
-    F: AsyncFnOnce(A, B) -> Call<()>,
+    A: FromValue + ?Sized,
+    B: FromValue + ?Sized,
+    F: AsyncFnOnce(A::Me<'_>, B::Me<'_>) -> Call<()>,
 {
-    type Alloc = (Alloc<A::Alloc>, Alloc<B::Alloc>);
+    const N: usize = 2;
 
-    async fn call(self, args: &'val mut Arguments<'val, Self::Alloc>) -> Call<()> {
-        let a = <A>::from_value(args.args, args.names[0], &mut args.a.0)?;
-        let b = <B>::from_value(args.args, args.names[1], &mut args.a.1)?;
+    async fn call(self, args: Arguments<'_>) -> Call<()> {
+        let a = <A>::from_value(args.args, args.names[0])?;
+        let b = <B>::from_value(args.args, args.names[1])?;
         (self)(a, b).await?;
         Ok(())
     }
 }
 
-impl<'val, A, B, C, F> Handler<'val, (A, B, C)> for F
-where
-    A: FromValue<'val>,
-    B: FromValue<'val>,
-    C: FromValue<'val>,
-    F: AsyncFnOnce(A, B, C) -> Call<()>,
-{
-    type Alloc = (Alloc<A::Alloc>, Alloc<B::Alloc>, Alloc<C::Alloc>);
-
-    async fn call(self, args: &'val mut Arguments<'val, Self::Alloc>) -> Call<()> {
-        let a = <A>::from_value(args.args, args.names[0], &mut args.a.0)?;
-        let b = <B>::from_value(args.args, args.names[1], &mut args.a.1)?;
-        let c = <C>::from_value(args.args, args.names[2], &mut args.a.2)?;
-        (self)(a, b, c).await?;
-        Ok(())
-    }
+trait FromValue {
+    type Me<'val>;
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>>;
 }
 
-pub struct Alloc<T>(Option<T>);
+impl FromValue for str {
+    type Me<'val> = &'val Self;
 
-impl<T> Alloc<T> {
-    fn alloc(&mut self, value: T) -> &mut T {
-        self.0.insert(value)
-    }
-
-    fn into_inner(self) -> T {
-        self.0.expect("allocated value")
-    }
-}
-
-impl<T> Default for Alloc<T> {
-    fn default() -> Self {
-        Self(None)
-    }
-}
-
-pub trait FromValue<'val>: Sized {
-    type Alloc: 'static;
-    fn from_value(value: &'val Value, name: &str, a: &'val mut Alloc<Self::Alloc>) -> Call<Self>;
-}
-
-impl<'val, R> FromValue<'val> for R
-where
-    R: FromBorrowedValue<'val>,
-{
-    type Alloc = Infallible;
-
-    fn from_value(value: &'val Value, name: &str, _: &'val mut Alloc<Self::Alloc>) -> Call<Self> {
-        R::from_borrowed_value(value, name)
-    }
-}
-
-trait FromBorrowedValue<'val>: Sized {
-    fn from_borrowed_value(value: &'val Value, name: &str) -> Call<Self>;
-}
-
-impl<'val> FromBorrowedValue<'val> for &'val str {
-    fn from_borrowed_value(value: &'val Value, name: &str) -> Call<Self> {
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>> {
         value[name]
             .as_str()
             .ok_or_else(|| format!("key {name} not found"))
     }
 }
 
-impl FromBorrowedValue<'_> for String {
-    fn from_borrowed_value(value: &Value, name: &str) -> Call<Self> {
-        <&str>::from_borrowed_value(value, name).map(Self::from)
+impl FromValue for String {
+    type Me<'val> = Self;
+
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>> {
+        <str>::from_value(value, name).map(Self::from)
     }
 }
 
-impl FromBorrowedValue<'_> for u64 {
-    fn from_borrowed_value(value: &Value, name: &str) -> Call<Self> {
-        value[name]
-            .as_u64()
-            .ok_or_else(|| format!("key {name} not found"))
-    }
-}
+impl FromValue for i64 {
+    type Me<'val> = Self;
 
-impl FromBorrowedValue<'_> for i64 {
-    fn from_borrowed_value(value: &Value, name: &str) -> Call<Self> {
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>> {
         value[name]
             .as_i64()
             .ok_or_else(|| format!("key {name} not found"))
     }
 }
 
-impl<'val> FromValue<'val> for &'val Path {
-    type Alloc = PathBuf;
+impl FromValue for u64 {
+    type Me<'val> = Self;
 
-    fn from_value(value: &'val Value, name: &str, a: &'val mut Alloc<Self::Alloc>) -> Call<Self> {
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>> {
+        value[name]
+            .as_u64()
+            .ok_or_else(|| format!("key {name} not found"))
+    }
+}
+
+impl FromValue for PathBuf {
+    type Me<'val> = Self;
+
+    fn from_value<'val>(value: &'val Value, name: &str) -> Call<Self::Me<'val>> {
         let path = Path::new(
             value[name]
                 .as_str()
@@ -192,14 +159,6 @@ impl<'val> FromValue<'val> for &'val Path {
             })?;
         }
 
-        Ok(a.alloc(hostdir))
-    }
-}
-
-impl FromBorrowedValue<'_> for PathBuf {
-    fn from_borrowed_value(value: &Value, name: &str) -> Call<Self> {
-        let mut a = Alloc::default();
-        <&Path>::from_value(value, name, &mut a)?;
-        Ok(a.into_inner())
+        Ok(hostdir)
     }
 }

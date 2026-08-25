@@ -15,6 +15,7 @@ rust-version = "1.96"
 dai = { version = "=0.0.1", path = "dai" }
 # third-party
 async-channel = "2.5.0"
+async-fs = "2.2.0"
 blocking = "1.6.2"
 futures-lite = { version = "2.6.1", default-features = false }
 nix = "0.31"

@@ -5,7 +5,12 @@ mod provider;
 mod responses;
 
 use {
-    crate::{gemini::Gemini, handler::Call, provider::*, responses::OpenRouter},
+    crate::{
+        gemini::Gemini,
+        handler::{Call, Func},
+        provider::*,
+        responses::OpenRouter,
+    },
     futures_lite::{StreamExt, future},
     serde::Serialize,
     serde_json::{Map, Value, value::RawValue},
@@ -14,9 +19,7 @@ use {
         env::{self, VarError},
         error,
         fmt::Write,
-        fs,
-        path::Path,
-        pin::Pin,
+        path::PathBuf,
     },
 };
 
@@ -38,6 +41,7 @@ async fn run() -> Run<()> {
             name: "fs.read".into(),
             description: "Read a text file from the agent's working directory".into(),
             parameters: vec![path_parameter.clone()].into_boxed_slice(),
+            func: handler::make(async || { Ok(()) }, &[]),
         },
         Tool {
             name: "fs.write".into(),
@@ -51,6 +55,10 @@ async fn run() -> Run<()> {
                 },
             ]
             .into_boxed_slice(),
+            func: handler::make::<_, fn(PathBuf, str), _>(
+                fs_write,
+                &["path", "content"],
+            ),
         },
     ]);
 
@@ -96,29 +104,21 @@ async fn run() -> Run<()> {
                         continue;
                     };
 
-                    if tool.name.as_ref() == "fs.write" {
-                        let func: Pin<Box<dyn Future<Output = Call<Value>>>> = Box::pin(async {
-                            handler::args(&args, &["path", "content"])
-                                .call(fs_write)
-                                .await
-                        });
+                    let call_output = match (tool.func)(&args).await {
+                        Ok(output) => CallOutput { id, name, output },
+                        Err(e) => CallOutput {
+                            id,
+                            name,
+                            output: Value::Object({
+                                let mut map = Map::new();
+                                map.insert("error".into(), Value::String(e));
+                                map
+                            }),
+                        },
+                    };
 
-                        let call_output = match func.await {
-                            Ok(output) => CallOutput { id, name, output },
-                            Err(e) => CallOutput {
-                                id,
-                                name,
-                                output: Value::Object({
-                                    let mut map = Map::new();
-                                    map.insert("error".into(), Value::String(e));
-                                    map
-                                }),
-                            },
-                        };
-
-                        // TODO
-                        req = Some(Request::CallOutputs(vec![call_output]));
-                    }
+                    // TODO
+                    req = Some(Request::CallOutputs(vec![call_output]));
                 }
             }
         }
@@ -127,14 +127,17 @@ async fn run() -> Run<()> {
     Ok(())
 }
 
-async fn fs_write(path: &Path, content: &str) -> Call<()> {
-    fs::write(path, content).map_err(|e| format!("failed to write in file {}: {e}", path.display()))
+async fn fs_write(path: PathBuf, content: &str) -> Call<()> {
+    async_fs::write(&path, content)
+        .await
+        .map_err(|e| format!("failed to write in file {}: {e}", path.display()))
 }
 
 pub struct Tool {
     name: Box<str>,
     description: Box<str>,
     parameters: Box<[Parameter]>,
+    func: Func,
 }
 
 #[derive(Clone)]
