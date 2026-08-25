@@ -1,29 +1,12 @@
 [package]
 name = "dai"
-description = "Keep agents in their place"
+description = "Dai shared crate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-
-[[bin]]
-name = "dai"
-path = "src/main.rs"
-
-[dependencies]
-async-channel.workspace = true
-async-fs.workspace = true
-blocking.workspace = true
-futures-lite = { workspace = true, features = ["std"] }
-rand.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["raw_value"] }
-ureq = { workspace = true, features = ["rustls"] }
-
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["user"] }
 
 [lints]
 workspace = true

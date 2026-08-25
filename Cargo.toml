@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["dai"]
+members = ["dai", "dai-ctl", "dai-daemon"]
 
 [workspace.package]
 version = "0.0.1"
@@ -13,6 +13,8 @@ rust-version = "1.96"
 [workspace.dependencies]
 # workspace
 dai = { version = "=0.0.1", path = "dai" }
+dai-ctl = { version = "=0.0.1", path = "dai-ctl" }
+dai-daemon = { version = "=0.0.1", path = "dai-daemon" }
 # third-party
 async-channel = "2.5.0"
 async-fs = "2.2.0"
